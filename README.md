@@ -1,54 +1,40 @@
-# rk-tool
+# eadk-rk-flash
 
-Windows 下用命令行烧写瑞芯微固件，不依赖 RKDevTool 图形界面。
+EADK 瑞芯微（Rockchip）Windows 烧录组件：**EADK RK Flash**。
 
-支持：
+对外（经 Gateway）：`http://127.0.0.1:18081/rk-flash/`  
+本机直连：`http://127.0.0.1:18172/rk-flash/`
 
-- 整包烧写 `update.img`、单分区烧写
-- 设备擦除、读芯片/存储/分区信息
-- 多设备 `-s LocationID` 选择
+组件 id / tool：`rk-flash`（禁止泛名 `flash`，以便后续其它平台烧录组件并存）。
 
-完整说明见 [说明书.md](说明书.md)。
+## 能力
+
+- 整包 `update.img`、单分区镜像烧写（基于官方 `upgrade_tool`）
+- Agent 接口：`/rk-flash/help`、`/rk-flash/api/help`
+- 本机路径 / HTTP 上传 / 网络镜像 URL（须为具体文件）
+- 多板 `LocationID`（`select`）；单板可不指定
 
 ## 目录
 
 ```text
-rk-tool/
-├── flash.bat                 推荐入口
-├── firmware/                 放置镜像（不入库）
-├── scripts/                  烧写脚本
-└── tools/                    官方 upgrade_tool 与 USB 驱动
+eadk/                 EADK 启动器与 HTTP 服务
+scripts/              CLI 烧写脚本（flash.ps1）
+tools/upgrade_tool/   官方 Windows CLI
+skills/rk-flash/      Agent Skill
+rk_flash_config.json.example
+说明书.md             CLI 说明书
 ```
 
-## 快速开始
-
-1. 管理员运行 `tools\DriverAssistant\DriverInstall.exe` 安装驱动
-2. 将 `update.img`（以及可选的 `boot.img` / `uboot.img` / `rootfs.img`）放到 `firmware\`  
-   根目录已有 `update.img` 时也可直接烧，不必先搬文件
-3. 设备进入 **Loader** 或 **Maskrom** 后执行：
+## 构建与组装
 
 ```bat
-flash.bat
+eadk\build.bat
 ```
 
-单分区：
+产物：`output\eadk-rk-flash.exe`。由 EADK Manager 的 `assemble_kit.bat` 拷入 `components\rk-flash\`。
 
-```bat
-flash.bat boot
-flash.bat uboot
-flash.bat rootfs
-flash.bat boot uboot rootfs
-```
+## Agent
 
-查看设备 / 是否 Maskrom：
+见 [skills/rk-flash/SKILL.md](skills/rk-flash/SKILL.md)。
 
-```bat
-flash.bat status
-flash.bat maskrom
-flash.bat info
-flash.bat erase
-```
-
-多设备时先 `flash.bat ld` 看 LocationID，再 `flash.bat -s 244 update`。
-
-查看用法：`flash.bat help`
+CLI 细节见 [说明书.md](说明书.md)。

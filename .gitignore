@@ -1,3 +1,8 @@
+# Build / runtime
+output/
+cache/
+*.log
+
 # 用户固件体积大，不入库
 firmware/*.img
 firmware/*.IMG
@@ -5,5 +10,12 @@ firmware/*.bin
 firmware/*.BIN
 firmware/parameter.txt
 /update.img
-*.log
 downloads/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc

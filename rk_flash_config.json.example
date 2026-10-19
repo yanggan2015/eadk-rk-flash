@@ -1,0 +1,11 @@
+{
+  "eadk": { "tool": "rk-flash" },
+  "display_name": "EADK RK Flash",
+  "server": {
+    "port": 18172,
+    "http_bind": "127.0.0.1",
+    "base_path": "/rk-flash",
+    "advertise_http_port": 18081,
+    "discoverable": false
+  }
+}
