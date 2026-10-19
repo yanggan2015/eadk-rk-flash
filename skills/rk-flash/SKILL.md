@@ -8,6 +8,8 @@
 
 直连本机：`http://127.0.0.1:18172/rk-flash/...`
 
+PowerShell 用 `curl.exe`；JSON 用单引号，例如 `-d '{"action":"maskrom"}'`。
+
 **一台设备可不带 `select`；多台必须 `select=LocationID`。**
 
 ## 示例
@@ -16,12 +18,10 @@
 curl.exe -s http://127.0.0.1:18081/rk-flash/health
 curl.exe -s http://127.0.0.1:18081/rk-flash/api/help
 curl.exe -s http://127.0.0.1:18081/rk-flash/api/devices
+curl.exe -s http://127.0.0.1:18081/rk-flash/api/relay-boards
 
-curl.exe -s -X POST http://127.0.0.1:18081/rk-flash/api/action \
-  -H "Content-Type: application/json" \
-  -d "{\"action\":\"maskrom\"}"
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"action":"maskrom"}' http://127.0.0.1:18081/rk-flash/api/action
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"board":"BOARD"}' http://127.0.0.1:18081/rk-flash/api/enter-maskrom
 
-curl.exe -s -X POST http://127.0.0.1:18081/rk-flash/api/flash \
-  -H "Content-Type: application/json" \
-  -d "{\"url\":\"http://172.16.45.24/dsp_release/noesis3588/QSemOS-24.03-LTS/boot.img\"}"
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"url":"http://172.16.45.24/dsp_release/noesis3588/QSemOS-24.03-LTS/boot.img"}' http://127.0.0.1:18081/rk-flash/api/flash
 ```

@@ -15,6 +15,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
 $Bind = "127.0.0.1"
 $Base = "/rk-flash"
 $Port = 18172
+$Gateway = "http://127.0.0.1:18081"
 if ($ConfigPath) {
     if (-not [IO.Path]::IsPathRooted($ConfigPath)) { $ConfigPath = Join-Path (Get-Location) $ConfigPath }
     if (-not (Test-Path -LiteralPath $ConfigPath)) { throw "config not found: $ConfigPath" }
@@ -26,14 +27,58 @@ if ($ConfigPath) {
         if ($cfg.server.port) { $Port = [int]$cfg.server.port }
         if ($cfg.server.http_bind) { $Bind = [string]$cfg.server.http_bind }
         if ($cfg.server.base_path) { $Base = [string]$cfg.server.base_path.TrimEnd("/") }
+        if ($cfg.server.gateway) { $Gateway = [string]$cfg.server.gateway.TrimEnd("/") }
     }
 }
 if ($HttpPort -gt 0) { $Port = $HttpPort }
 if (-not $Base.StartsWith("/")) { $Base = "/" + $Base }
+if ($env:EADK_GATEWAY) { $Gateway = [string]$env:EADK_GATEWAY.TrimEnd("/") }
+
+function Test-EadkGateway([string]$gw) {
+    if (-not $gw) { return $false }
+    try {
+        $r = Invoke-WebRequest -Uri "$gw/relay/health" -UseBasicParsing -TimeoutSec 2
+        return ($r.StatusCode -eq 200 -and $r.Content -match '"tool"\s*:\s*"relay"')
+    } catch { return $false }
+}
+
+function Resolve-EadkGateway([string]$preferred) {
+    $cands = New-Object System.Collections.Generic.List[string]
+    if ($preferred) { [void]$cands.Add($preferred.TrimEnd("/")) }
+    [void]$cands.Add("http://127.0.0.1:18081")
+    $extras = @()
+    try {
+        $extras = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } |
+            Select-Object -ExpandProperty IPAddress)
+    } catch { $extras = @() }
+    # 优先普通网卡，ICS/热点 192.168.137.* 放后
+    foreach ($ip in ($extras | Where-Object { $_ -notlike "192.168.137.*" })) {
+        [void]$cands.Add("http://${ip}:18081")
+    }
+    foreach ($ip in ($extras | Where-Object { $_ -like "192.168.137.*" })) {
+        [void]$cands.Add("http://${ip}:18081")
+    }
+    $seen = @{}
+    foreach ($c in $cands) {
+        if ($seen.ContainsKey($c)) { continue }
+        $seen[$c] = $true
+        if (Test-EadkGateway $c) { return $c }
+    }
+    if ($preferred) { return $preferred.TrimEnd("/") }
+    return "http://127.0.0.1:18081"
+}
+
+$Gateway = Resolve-EadkGateway $Gateway
+Write-Host "EADK RK Flash gateway=$Gateway"
 
 $ToolDir = Join-Path $Root "tools\upgrade_tool"
 $ToolExe = Join-Path $ToolDir "upgrade_tool.exe"
 $FlashPs1 = Join-Path $Root "scripts\flash.ps1"
+$EnterMaskromBat = Join-Path $Root "scripts\enter-maskrom.bat"
+if (-not (Test-Path -LiteralPath $EnterMaskromBat)) {
+    $EnterMaskromBat = Join-Path $Root "enter-maskrom.bat"
+}
 $Cache = Join-Path $Root "cache"
 $Firmware = Join-Path $Root "firmware"
 if (-not (Test-Path -LiteralPath $Cache)) { New-Item -ItemType Directory -Path $Cache | Out-Null }
@@ -173,6 +218,61 @@ function Start-FlashProcess([string]$image, [string]$select, [bool]$noReset, [bo
     Start-ScriptJob $toolArgs $image
 }
 
+function Get-RelayBoards {
+    $url = "$Gateway/relay/api/boards"
+    try {
+        $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 8
+        $j = $resp.Content | ConvertFrom-Json
+    } catch {
+        throw "无法访问 $url ：$($_.Exception.Message)"
+    }
+    $names = @()
+    if ($null -ne $j.boards) {
+        foreach ($p in @($j.boards.PSObject.Properties)) {
+            if ($p -and $p.Name) { $names += [string]$p.Name }
+        }
+    }
+    return @{
+        ok      = $true
+        gateway = $Gateway
+        count   = $names.Count
+        boards  = $names
+        raw     = $j
+    }
+}
+
+function Start-EnterMaskrom([string]$board) {
+    if ($script:Pending) { throw "已有任务在进行" }
+    if ($board -notmatch '^[A-Za-z0-9_-]+$') { throw "非法 board 名" }
+    if (-not (Test-Path -LiteralPath $EnterMaskromBat)) {
+        throw "缺少 enter-maskrom.bat（应在 scripts\ 下）"
+    }
+    $log = Join-Path $Cache "enter-maskrom-last.log"
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $env:SystemRoot "System32\cmd.exe"
+    $psi.Arguments = "/c `"$EnterMaskromBat`" $board"
+    $psi.WorkingDirectory = $Root
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    $psi.StandardOutputEncoding = $utf8
+    $psi.StandardErrorEncoding = $utf8
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+    $env:EADK_GATEWAY = $Gateway
+    [void]$p.Start()
+    $script:Pending = @{
+        proc    = $p
+        outTask = $p.StandardOutput.ReadToEndAsync()
+        errTask = $p.StandardError.ReadToEndAsync()
+        ctx     = $null
+        image   = "enter-maskrom:$board"
+        log     = $log
+    }
+}
+
 function Complete-Pending {
     $job = $script:Pending
     if (-not $job) { return }
@@ -243,9 +343,10 @@ html.kit h1{font-size:16px}
 .card h2{margin:0 0 10px;font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
 label.field{display:block;width:100%;font-size:12px;color:var(--muted);margin:6px 0 4px}
-input[type=text],input[type=file]{width:100%;padding:9px 11px;border-radius:10px;border:1px solid var(--line);
+input[type=text],input[type=file],select{width:100%;padding:9px 11px;border-radius:10px;border:1px solid var(--line);
   background:rgba(255,255,255,.04);color:var(--text);font:inherit}
-input[type=text]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--soft)}
+input[type=text]:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--soft)}
+select option{background:#132033;color:var(--text)}
 .btn{border:1px solid var(--line);border-radius:999px;background:rgba(255,255,255,.05);
   color:var(--text);padding:7px 14px;font-size:12px;font-weight:650;cursor:pointer}
 .btn:hover{border-color:var(--accent);color:var(--accent)}
@@ -263,18 +364,27 @@ pre{margin:0;padding:12px;border-radius:10px;background:rgba(0,0,0,.28);border:1
     <a href="help">Agent 接口</a>
   </div>
   <div class="card">
-    <h2>设备</h2>
+    <h2>Rockusb 设备 <span id="dev-status" style="font-weight:500;text-transform:none;letter-spacing:0;margin-left:8px">检测中…</span></h2>
     <div class="row">
-      <button class="btn" id="dev">刷新设备</button>
       <button class="btn" id="act-maskrom">是否 Maskrom</button>
       <button class="btn" id="act-info">设备信息</button>
       <button class="btn" id="act-reset">复位</button>
-      <button class="btn" id="act-mask">切到 Maskrom</button>
+      <button class="btn" id="act-mask">Loader→Maskrom</button>
       <button class="btn danger" id="act-erase">整片擦除</button>
     </div>
-    <label class="field">LocationID（仅多台时必填；一台可留空）</label>
-    <input id="select" type="text" placeholder="224"/>
-    <pre id="devices" style="margin-top:10px">(未查询)</pre>
+    <label class="field">LocationID（多台必选；自动检测后填入）</label>
+    <select id="select"><option value="">（自动 / 单台可空）</option></select>
+  </div>
+  <div class="card">
+    <h2>进 Maskrom（Relay 复位 + SSH Bridge）</h2>
+    <p style="margin:0 0 8px;font-size:12px;color:var(--muted)">板名须同时存在于 Relay 与 SSH Bridge。流程：reset → Ctrl+C → 擦 eMMC boot → reset。</p>
+    <label class="field">板子</label>
+    <div class="row">
+      <select id="board" style="flex:1;min-width:160px;padding:9px 11px;border-radius:10px;border:1px solid var(--line);background:rgba(255,255,255,.04);color:var(--text);font:inherit">
+        <option value="">（选择板子）</option>
+      </select>
+      <button class="btn primary" id="enter-maskrom">进 Maskrom</button>
+    </div>
   </div>
   <div class="card">
     <h2>本地镜像</h2>
@@ -301,7 +411,12 @@ pre{margin:0;padding:12px;border-radius:10px;background:rgba(0,0,0,.28);border:1
 <script>
 if (location.search.indexOf("eadk_kit=1")>=0) document.documentElement.classList.add("kit");
 function base(){var p=location.pathname; if(p.slice(-1)!=="/") p+="/"; return p.replace(/\/$/,"")}
-function show(x){document.getElementById("log").textContent=typeof x==="string"?x:JSON.stringify(x,null,2)}
+function logText(d){
+  if(!d) return "";
+  if(typeof d==="string") return d;
+  return d.log || "";
+}
+function show(d){document.getElementById("log").textContent=logText(d)}
 async function api(path, opt){
   const r=await fetch(base()+path, opt||{});
   const t=await r.text();
@@ -309,13 +424,23 @@ async function api(path, opt){
 }
 function sel(){return document.getElementById("select").value.trim()}
 function withSel(body){var s=sel(); if(s) body.select=s; return body}
-document.getElementById("dev").onclick=async function(){
-  const d=await api("/api/devices");
-  document.getElementById("devices").textContent=JSON.stringify(d,null,2);
-  show(d);
-};
+function fillSelect(el, values, emptyLabel){
+  var cur=el.value, html='<option value="">'+emptyLabel+'</option>';
+  (values||[]).forEach(function(v){ html+='<option value="'+v+'">'+v+'</option>'; });
+  el.innerHTML=html;
+  if(cur && values && values.indexOf(cur)>=0) el.value=cur;
+  else if(values && values.length===1) el.value=values[0];
+}
+async function refreshDevices(){
+  var d;
+  try{ d=await api("/api/devices") }catch(e){ return }
+  var ids=(d.devices||[]).map(function(x){return x.location_id}).filter(Boolean);
+  fillSelect(document.getElementById("select"), ids, "（自动 / 单台可空）");
+  var st=document.getElementById("dev-status");
+  if(!d.count) st.textContent="未检测到 Rockusb";
+  else st.textContent="已挂载 "+d.count+" 台"+(d.need_select?"（请选择 LocationID）":"");
+}
 async function act(name){
-  show("执行 "+name+" ...");
   show(await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(withSel({action:name}))}));
 }
 document.getElementById("act-maskrom").onclick=function(){act("maskrom")};
@@ -323,18 +448,30 @@ document.getElementById("act-info").onclick=function(){act("info")};
 document.getElementById("act-reset").onclick=function(){act("reset")};
 document.getElementById("act-mask").onclick=function(){act("to-maskrom")};
 document.getElementById("act-erase").onclick=function(){ if(confirm("整片擦除？")) act("erase") };
+async function refreshBoards(){
+  var d;
+  try{ d=await api("/api/relay-boards") }catch(e){ return }
+  fillSelect(document.getElementById("board"), d.boards||[], "（选择板子）");
+}
+document.getElementById("enter-maskrom").onclick=async function(){
+  var b=document.getElementById("board").value.trim();
+  if(!b) return;
+  if(!confirm("对板子 "+b+" 执行进 Maskrom？（会复位并擦 eMMC boot 区）")) return;
+  show(await api("/api/enter-maskrom",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({board:b})}));
+};
+refreshBoards();
+setInterval(refreshBoards, 5000);
+refreshDevices();
+setInterval(refreshDevices, 5000);
 document.getElementById("go-path").onclick=async function(){
-  show("烧写中...");
   show(await api("/api/flash",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(withSel({path:document.getElementById("path").value}))}));
 };
 document.getElementById("go-url").onclick=async function(){
-  show("下载并烧写中...");
   show(await api("/api/flash",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(withSel({url:document.getElementById("url").value}))}));
 };
 document.getElementById("go-up").onclick=async function(){
   var f=document.getElementById("up").files[0];
-  if(!f){show("未选择文件");return}
-  show("上传并烧写中...");
+  if(!f) return;
   var q="/api/upload?name="+encodeURIComponent(f.name)+"&flash=1";
   var s=sel(); if(s) q+="&select="+encodeURIComponent(s);
   show(await api(q,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:f}));
@@ -349,7 +486,8 @@ function Get-HelpMarkdown([string]$pub) {
     return @"
 # EADK RK Flash — Agent 操作手册
 
-先看约定与 devices 字段，再复制下面的 curl（说明紧挨命令，不同命令之间空一行）。PowerShell 请用 curl.exe。
+先看约定与 devices 字段，再复制下面的 curl（说明紧挨命令，不同命令之间空一行）。
+PowerShell / Agent 请用 curl.exe；JSON 用单引号包住（与 sshbridge /help 相同），不要写 -d "{\"a\":1}"。
 
 - 机器清单: $b/api/help
 - WebUI: $b/
@@ -395,67 +533,79 @@ JSON 顶层:
 
 ### 3.1 查看是否 Maskrom
 
-**POST /api/action action=maskrom（当前是 Maskrom 则 ok）**
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"action\":\"maskrom\"}" $b/api/action
+**POST /api/action action=maskrom（当前是 Maskrom 则 ok=true / exit_code=0）**
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"action":"maskrom"}' $b/api/action
 
 **多板时带 LocationID**
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"action\":\"maskrom\",\"select\":\"224\"}" $b/api/action
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"action":"maskrom","select":"224"}' $b/api/action
 
 ### 3.2 读设备信息（芯片 / 存储 / 分区）
 
 **POST /api/action action=info**
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"action\":\"info\"}" $b/api/action
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"action":"info"}' $b/api/action
 
 **仅芯片 ID / 存储 / 分区表**
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"action\":\"rci\"}" $b/api/action
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"action":"rci"}' $b/api/action
 
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"action\":\"rfi\"}" $b/api/action
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"action":"rfi"}' $b/api/action
 
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"action\":\"pl\"}" $b/api/action
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"action":"pl"}' $b/api/action
 
-### 3.3 复位 / 切到 Maskrom / Download Boot / 整片擦除
+### 3.3 复位 / Loader→Maskrom / Download Boot / 整片擦除
 
 **复位**
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"action\":\"reset\"}" $b/api/action
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"action":"reset"}' $b/api/action
 
-**Loader 切到 Maskrom（rd 3）**
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"action\":\"to-maskrom\"}" $b/api/action
+**Loader→Maskrom（upgrade_tool to-maskrom；设备须已在 Rockusb）**
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"action":"to-maskrom"}' $b/api/action
 
-**Maskrom 下 Download Boot（需 firmware\\MiniLoaderAll.bin）**
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"action\":\"db\"}" $b/api/action
+**Maskrom 下 Download Boot（需 firmware\MiniLoaderAll.bin）**
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"action":"db"}' $b/api/action
 
 **整片擦除（危险）**
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"action\":\"erase\",\"select\":\"224\"}" $b/api/action
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"action":"erase","select":"224"}' $b/api/action
 
-### 3.4 烧写网络镜像（具体文件 URL）
+### 3.4 经 Relay+SSH Bridge 进 Maskrom（enter-maskrom.bat）
+
+板名须在 Relay 与 SSH Bridge 中同名配置。
+
+**列出 Relay 板子**
+curl.exe -s $b/api/relay-boards
+
+**进 Maskrom（阻塞到脚本结束）**
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"board":"BOARD"}' $b/api/enter-maskrom
+
+### 3.5 烧写网络镜像（具体文件 URL）
 
 **烧 boot.img**
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"url\":\"http://172.16.45.24/dsp_release/noesis3588/QSemOS-24.03-LTS/boot.img\"}" $b/api/flash
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"url":"http://172.16.45.24/dsp_release/noesis3588/QSemOS-24.03-LTS/boot.img"}' $b/api/flash
 
 **烧 update.img（整包，体积大）**
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"url\":\"http://172.16.45.24/dsp_release/noesis3588/QSemOS-24.03-LTS/update.img\",\"select\":\"224\"}" $b/api/flash
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"url":"http://172.16.45.24/dsp_release/noesis3588/QSemOS-24.03-LTS/update.img","select":"224"}' $b/api/flash
 
-### 3.5 烧写本机镜像 / 上传后烧写
+### 3.6 烧写本机镜像 / 上传后烧写
 
 **本机路径**
-curl.exe -s -X POST -H "Content-Type: application/json" -d "{\"path\":\"D:\\\\images\\\\update.img\"}" $b/api/flash
+curl.exe -s -X POST -H "Content-Type: application/json" -d '{"path":"C:\\code\\rk-tool\\update.img"}' $b/api/flash
 
-**先上传再烧（query flash=1；多板加 select）**
-curl.exe -s -X POST -H "Content-Type: application/octet-stream" --data-binary "@boot.img" "$b/api/upload?name=boot.img&flash=1"
+**先上传再烧（@ 后为本地文件路径；query flash=1；多板加 &select=）**
+curl.exe -s -X POST -H "Content-Type: application/octet-stream" --data-binary "@C:\code\rk-tool\update.img" "$b/api/upload?name=update.img&flash=1"
 
 **只上传，返回 path 后再调 /api/flash**
-curl.exe -s -X POST -H "Content-Type: application/octet-stream" --data-binary "@boot.img" "$b/api/upload?name=boot.img"
+curl.exe -s -X POST -H "Content-Type: application/octet-stream" --data-binary "@C:\code\rk-tool\update.img" "$b/api/upload?name=update.img"
 
 ---
 
 ## 4. 接口速查（与 /api/help 一致）
 
-- ``GET /health`` — 存活；``tool=flash``
+- ``GET /health`` — 存活；``tool=rk-flash``
 - ``GET /api/help`` — 机器可读 operations
 - ``GET /help`` — Agent 接口（text/plain Markdown）
 - ``GET /api/devices`` — 列出 Rockusb；多板看 location_id
 - ``GET /api/resolve?url=`` — 校验具体镜像 URL
 - ``POST /api/action`` — status|maskrom|info|rci|rfi|pl|reset|to-maskrom|db|erase；可选 select
+- ``GET /api/relay-boards`` — 经 Gateway 拉 Relay 板名列表
+- ``POST /api/enter-maskrom`` — body ``board``；跑 enter-maskrom.bat
 - ``POST /api/flash`` — path 或 url；可选 select / no_reset / erase_first
 - ``POST /api/upload?name=&flash=`` — 上传原始字节；flash=1 则接着烧
 
@@ -492,9 +642,10 @@ function Handle-Request($ctx) {
         $pub = "http://127.0.0.1:18081"
         if ($hostHdr -match "^([^:]+):(\d+)$") {
             $h = $Matches[1]; $hp = [int]$Matches[2]
-            if ($hp -eq 18081) { $pub = "http://$h:18081" }
-            elseif ($h -eq "127.0.0.1" -or $h -eq "localhost") { $pub = "http://127.0.0.1:$Port" }
-            else { $pub = "http://$h:18081" }
+            # ${h} 必须加大括号，否则 $h:18081 被 PowerShell 当成作用域变量
+            if ($hp -eq 18081) { $pub = "http://${h}:18081" }
+            elseif ($h -eq "127.0.0.1" -or $h -eq "localhost") { $pub = "http://127.0.0.1:${Port}" }
+            else { $pub = "http://${h}:18081" }
         }
         Send-Text $ctx 200 "text/plain; charset=utf-8" (Get-HelpMarkdown $pub)
         return
@@ -509,6 +660,8 @@ function Handle-Request($ctx) {
             operations = @(
                 @{ id = "device.list"; method = "GET"; path = "$Base/api/devices"; side_effect = $false; summary = "List Rockusb devices and LocationID" }
                 @{ id = "device.action"; method = "POST"; path = "$Base/api/action"; body = @{ action = "status|maskrom|info|rci|rfi|pl|reset|to-maskrom|db|erase"; select = "LocationID when more than one device" }; side_effect = $true; summary = "Device status and maintenance" }
+                @{ id = "relay.boards"; method = "GET"; path = "$Base/api/relay-boards"; side_effect = $false; summary = "List board names from Relay via Gateway" }
+                @{ id = "board.enter_maskrom"; method = "POST"; path = "$Base/api/enter-maskrom"; body = @{ board = "relay/sshbridge board name" }; side_effect = $true; summary = "Run enter-maskrom.bat for a board" }
                 @{ id = "image.resolve"; method = "GET"; path = "$Base/api/resolve"; query = @{ url = "http://host/.../boot.img" }; side_effect = $false; summary = "Check a concrete image URL" }
                 @{ id = "image.flash"; method = "POST"; path = "$Base/api/flash"; body = @{ path = "local file"; url = "http://host/.../update.img"; select = "LocationID"; no_reset = $false; erase_first = $false }; side_effect = $true; summary = "Flash a local path or a concrete image URL" }
                 @{ id = "image.upload"; method = "POST"; path = "$Base/api/upload"; query = @{ name = "update.img"; flash = "1 optional" }; side_effect = $true; summary = "Upload raw image bytes" }
@@ -521,6 +674,27 @@ function Handle-Request($ctx) {
         $st.ok = $true
         $st.need_select = ($st.count -gt 1)
         Send-Json $ctx 200 $st
+        return
+    }
+    if ($method -eq "GET" -and $rel -eq "/api/relay-boards") {
+        try {
+            Send-Json $ctx 200 (Get-RelayBoards)
+        } catch {
+            Send-Err $ctx 502 "relay_unreachable" $_.Exception.Message
+        }
+        return
+    }
+    if ($method -eq "POST" -and $rel -eq "/api/enter-maskrom") {
+        if ($script:Pending) { Send-Err $ctx 409 "busy" "已有任务在进行"; return }
+        $j = Read-JsonBody $req
+        $board = if ($j -and $j.board) { [string]$j.board.Trim() } else { "" }
+        if (-not $board) { Send-Err $ctx 400 "bad_request" "需要 board"; return }
+        try {
+            Start-EnterMaskrom $board
+            $script:Pending.ctx = $ctx
+        } catch {
+            Send-Err $ctx 400 "bad_request" $_.Exception.Message
+        }
         return
     }
     if ($method -eq "GET" -and $rel -eq "/api/resolve") {
