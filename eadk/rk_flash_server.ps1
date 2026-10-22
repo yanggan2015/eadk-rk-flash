@@ -14,7 +14,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
 
 $Bind = "127.0.0.1"
 $Base = "/rk-flash"
-$Port = 18172
+$Port = 18086
 $Gateway = "http://127.0.0.1:18081"
 if ($ConfigPath) {
     if (-not [IO.Path]::IsPathRooted($ConfigPath)) { $ConfigPath = Join-Path (Get-Location) $ConfigPath }
