@@ -486,6 +486,8 @@ function Get-HelpMarkdown([string]$pub) {
     return @"
 # EADK RK Flash — Agent 操作手册
 
+**适用范围：仅用于瑞芯微（Rockchip）开发板的 USB 烧写。** 非瑞芯微板卡、其他厂商烧录工具不在本组件范围内。
+
 先看约定与 devices 字段，再复制下面的 curl（说明紧挨命令，不同命令之间空一行）。
 PowerShell / Agent 请用 curl.exe；JSON 用单引号包住（与 sshbridge /help 相同），不要写 -d "{\"a\":1}"。
 
@@ -497,6 +499,7 @@ PowerShell / Agent 请用 curl.exe；JSON 用单引号包住（与 sshbridge /he
 
 ## 1. 约定
 
+- **适用平台**：瑞芯微 Rockchip 开发板（Rockusb / upgrade_tool）；不适用于其他 SoC
 - **Base**: ``$b``（局域网经 Gateway 时用主机 IP:18081，勿写死 127.0.0.1 给远端 Agent）
 - 本机直连后端: ``http://127.0.0.1:$Port$Base``（不经 Gateway）
 - Rockusb 设备用 LocationID 区分；列表见 ``GET /api/devices`` 的 ``location_id``
